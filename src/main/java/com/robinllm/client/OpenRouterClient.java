@@ -6,6 +6,7 @@ import com.robinllm.dto.OpenAIChatResponse;
 import com.robinllm.dto.OpenAIChatStreamResponse;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import okhttp3.Call;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -21,11 +22,8 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
-import java.util.Spliterator;
-import java.util.Spliterators;
 import java.util.Iterator;
 
 @ApplicationScoped
@@ -45,8 +43,17 @@ public class OpenRouterClient implements LLMClient {
     }
 
     @Override
-    public Stream<OpenAIChatStreamResponse> sendChatRequestStream(OpenAIChatRequest request) throws Exception {
-        return sendChatRequestStreamWithRetry(request, 0);
+    public java.util.stream.Stream<OpenAIChatStreamResponse> sendChatRequestStream(OpenAIChatRequest request) throws Exception {
+        CancellableStream cancellable = sendChatRequestStreamCancellable(request);
+        return cancellable.getStream();
+    }
+
+    /**
+     * Send a streaming request and return a CancellableStream that can be used to
+     * cancel the request and close resources.
+     */
+    public CancellableStream sendChatRequestStreamCancellable(OpenAIChatRequest request) throws Exception {
+        return sendChatRequestStreamCancellableWithRetry(request, 0);
     }
 
     private OpenAIChatResponse sendChatRequestWithRetry(OpenAIChatRequest request, int attempt) throws Exception {
@@ -116,7 +123,7 @@ public class OpenRouterClient implements LLMClient {
         }
     }
 
-    private Stream<OpenAIChatStreamResponse> sendChatRequestStreamWithRetry(OpenAIChatRequest request, int attempt) throws Exception {
+    private CancellableStream sendChatRequestStreamCancellableWithRetry(OpenAIChatRequest request, int attempt) throws Exception {
         String apiKey = appConfig.getOpenrouterApiKey();
         if (apiKey == null || apiKey.isEmpty()) {
             throw new Exception("OpenRouter API key not configured");
@@ -137,7 +144,8 @@ public class OpenRouterClient implements LLMClient {
                 .post(body)
                 .build();
 
-        Response response = getHttpClient().newCall(httpRequest).execute();
+        Call call = getHttpClient().newCall(httpRequest);
+        Response response = call.execute();
         
         try {
             int responseCode = response.code();
@@ -156,7 +164,7 @@ public class OpenRouterClient implements LLMClient {
 
                 if (attempt < 5) {
                     response.close();
-                    return sendChatRequestStreamWithRetry(request, attempt + 1);
+                    return sendChatRequestStreamCancellableWithRetry(request, attempt + 1);
                 } else {
                     response.close();
                     throw new Exception("Rate limit exceeded after " + (attempt + 1) + " retries");
@@ -179,78 +187,10 @@ public class OpenRouterClient implements LLMClient {
             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
 
             // Create an iterator for SSE events
-            Iterator<OpenAIChatStreamResponse> iterator = new Iterator<>() {
-                private OpenAIChatStreamResponse nextChunk = null;
-                private boolean done = false;
-                private boolean closed = false;
+            Iterator<OpenAIChatStreamResponse> iterator = createIterator(reader);
 
-                @Override
-                public boolean hasNext() {
-                    if (done || closed) return false;
-                    if (nextChunk != null) return true;
-                    
-                    try {
-                        String line;
-                        while ((line = reader.readLine()) != null) {
-                            LOG.debug("Received SSE line: {}", line);
-                            
-                            // Handle empty lines (keep-alive)
-                            if (line.isEmpty()) continue;
-                            
-                            // Handle SSE data lines
-                            if (line.startsWith("data: ")) {
-                                String data = line.substring(6);
-                                
-                                // Check for stream end
-                                if (data.equals("[DONE]")) {
-                                    done = true;
-                                    return false;
-                                }
-                                
-                                try {
-                                    nextChunk = objectMapper.readValue(data, OpenAIChatStreamResponse.class);
-                                    return true;
-                                } catch (Exception e) {
-                                    LOG.error("Error parsing stream data: {}", data, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        
-                        // End of stream
-                        done = true;
-                        return false;
-                    } catch (IOException e) {
-                        LOG.error("Error reading stream", e);
-                        done = true;
-                        return false;
-                    }
-                }
-
-                @Override
-                public OpenAIChatStreamResponse next() {
-                    if (nextChunk == null && !hasNext()) {
-                        throw new java.util.NoSuchElementException();
-                    }
-                    OpenAIChatStreamResponse chunk = nextChunk;
-                    nextChunk = null;
-                    return chunk;
-                }
-            };
-
-            // Convert iterator to stream with proper cleanup
-            return StreamSupport.stream(
-                Spliterators.spliteratorUnknownSize(iterator, Spliterator.ORDERED),
-                false
-            ).onClose(() -> {
-                LOG.debug("Closing stream response");
-                try {
-                    reader.close();
-                } catch (IOException e) {
-                    LOG.warn("Error closing reader", e);
-                }
-                response.close();
-            });
+            // Return a cancellable stream that wraps everything
+            return new CancellableStream(call, response, reader, iterator, request.getModel());
 
         } catch (Exception e) {
             response.close();
@@ -259,10 +199,70 @@ public class OpenRouterClient implements LLMClient {
                 LOG.warn("Stream request failed for model {}, retrying in {}ms (attempt {}): {}",
                         request.getModel(), backoffMs, attempt + 1, e.getMessage());
                 Thread.sleep(backoffMs);
-                return sendChatRequestStreamWithRetry(request, attempt + 1);
+                return sendChatRequestStreamCancellableWithRetry(request, attempt + 1);
             }
             throw e;
         }
+    }
+
+    private Iterator<OpenAIChatStreamResponse> createIterator(BufferedReader reader) {
+        return new Iterator<>() {
+            private OpenAIChatStreamResponse nextChunk = null;
+            private boolean done = false;
+
+            @Override
+            public boolean hasNext() {
+                if (done) return false;
+                if (nextChunk != null) return true;
+                
+                try {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        LOG.debug("Received SSE line: {}", line);
+                        
+                        // Handle empty lines (keep-alive)
+                        if (line.isEmpty()) continue;
+                        
+                        // Handle SSE data lines
+                        if (line.startsWith("data: ")) {
+                            String data = line.substring(6);
+                            
+                            // Check for stream end
+                            if (data.equals("[DONE]")) {
+                                done = true;
+                                return false;
+                            }
+                            
+                            try {
+                                nextChunk = objectMapper.readValue(data, OpenAIChatStreamResponse.class);
+                                return true;
+                            } catch (Exception e) {
+                                LOG.error("Error parsing stream data: {}", data, e);
+                                continue;
+                            }
+                        }
+                    }
+                    
+                    // End of stream
+                    done = true;
+                    return false;
+                } catch (IOException e) {
+                    LOG.error("Error reading stream", e);
+                    done = true;
+                    return false;
+                }
+            }
+
+            @Override
+            public OpenAIChatStreamResponse next() {
+                if (nextChunk == null && !hasNext()) {
+                    throw new java.util.NoSuchElementException();
+                }
+                OpenAIChatStreamResponse chunk = nextChunk;
+                nextChunk = null;
+                return chunk;
+            }
+        };
     }
 
     private void handleRateLimit(String modelId) {
