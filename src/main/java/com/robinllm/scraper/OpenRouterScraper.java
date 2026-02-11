@@ -2,6 +2,7 @@ package com.robinllm.scraper;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.robinllm.config.AppConfig;
 import com.robinllm.model.LLMModel;
 import com.robinllm.repository.ModelRepository;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -27,14 +28,17 @@ public class OpenRouterScraper {
     @Inject
     ModelDetailsExtractor modelDetailsExtractor;
 
+    @Inject
+    AppConfig appConfig;
+
     public List<LLMModel> scrapeModels(String url, String filter) {
         List<LLMModel> models = new ArrayList<>();
 
         try {
             LOG.info("Fetching models from OpenRouter API");
-            String apiKey = System.getenv("OPENROUTER_API_KEY");
+            String apiKey = appConfig.getOpenrouterApiKey();
             if (apiKey == null || apiKey.isEmpty()) {
-                LOG.error("OPENROUTER_API_KEY not found in environment variables");
+                LOG.error("OPENROUTER_API_KEY not configured");
                 return models;
             }
 
@@ -102,23 +106,30 @@ public class OpenRouterScraper {
         model.setProvider(provider);
         model.setEndpoint("https://openrouter.ai/api/v1/chat/completions");
 
-        // Check if it's free based on pricing
+        // Check if it's free based on pricing or :free suffix in ID
         boolean isFree = false;
-        JsonNode pricing = modelNode.get("pricing");
-        if (pricing != null) {
-            String promptPrice = pricing.has("prompt") ? pricing.get("prompt").asText() : "0";
-            String completionPrice = pricing.has("completion") ? pricing.get("completion").asText() : "0";
-            
-            // Check if both prompt and completion are $0 or very close to 0
-            try {
-                double promptCost = Double.parseDouble(promptPrice);
-                double completionCost = Double.parseDouble(completionPrice);
-                isFree = (promptCost == 0.0 && completionCost == 0.0) ||
-                         (promptCost < 0.000001 && completionCost < 0.000001);
-            } catch (NumberFormatException e) {
-                // If parsing fails, check if it contains "free" or "$0"
-                isFree = promptPrice.contains("free") || completionPrice.contains("free") ||
-                        promptPrice.equals("0") || completionPrice.equals("0");
+        
+        // First check if model ID ends with :free (OpenRouter convention for free models)
+        if (id.endsWith(":free")) {
+            isFree = true;
+        }
+        
+        // Also check pricing as fallback
+        if (!isFree) {
+            JsonNode pricing = modelNode.get("pricing");
+            if (pricing != null) {
+                String promptPrice = pricing.has("prompt") ? pricing.get("prompt").asText() : "0";
+                String completionPrice = pricing.has("completion") ? pricing.get("completion").asText() : "0";
+                
+                // Check if both prompt and completion are exactly $0
+                try {
+                    double promptCost = Double.parseDouble(promptPrice);
+                    double completionCost = Double.parseDouble(completionPrice);
+                    isFree = (promptCost == 0.0 && completionCost == 0.0);
+                } catch (NumberFormatException e) {
+                    // If parsing fails, assume not free unless ID ends with :free
+                    isFree = false;
+                }
             }
         }
 

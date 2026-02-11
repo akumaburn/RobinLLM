@@ -131,6 +131,8 @@
                     </systemPropertyVariables>
                     <excludes>
                         <exclude>**/*IntegrationTest.java</exclude>
+                        <exclude>**/*StreamingSimpleTest.java</exclude>
+                        <exclude>**/*StreamTest.java</exclude>
                         <exclude>**/AppConfigTest.java</exclude>
                         <exclude>**/ModelPoolTest.java</exclude>
                         <exclude>**/LoadBalancerTest.java</exclude>

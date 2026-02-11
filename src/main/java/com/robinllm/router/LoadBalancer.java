@@ -98,6 +98,22 @@ public class LoadBalancer {
         LOG.debug("Recorded success for model {} ({}ms)", model.getId(), latencyMs);
     }
 
+    public void recordSuccess(LLMModel model) {
+        CircuitBreakerState state = circuitBreakers.computeIfAbsent(
+                model.getId(),
+                k -> new CircuitBreakerState()
+        );
+        state.recordSuccess();
+
+        ModelHealth health = modelHealth.computeIfAbsent(
+                model.getId(),
+                k -> new ModelHealth()
+        );
+        health.recordSuccess();
+
+        LOG.debug("Recorded success for model {}", model.getId());
+    }
+
     public void recordFailure(LLMModel model) {
         CircuitBreakerState state = circuitBreakers.computeIfAbsent(
                 model.getId(),
@@ -204,6 +220,10 @@ public class LoadBalancer {
                     recentLatencies.remove(0);
                 }
             }
+        }
+
+        public void recordSuccess() {
+            successCount.incrementAndGet();
         }
 
         public void recordFailure() {

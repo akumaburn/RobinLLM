@@ -23,7 +23,7 @@ class OpenRouterClientTest {
     @Test
     void testResetClearsAllCounters() {
         OpenRouterClient client = new OpenRouterClient();
-        client.resetRateLimitCounters();
+        client.resetRateLimiters();
         assertEquals(0, client.getRateLimitCount("any-model"));
     }
 }
