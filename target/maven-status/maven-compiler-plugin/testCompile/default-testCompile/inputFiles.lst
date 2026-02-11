@@ -1,0 +1,15 @@
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/model/ModelPoolTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/repository/BaseRepositoryTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/config/AppConfigTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/model/LLMModelTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/repository/ModelRepositoryTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/model/PerformanceMetricsTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/repository/MetricsRepositoryTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/dto/OpenAIChatResponseTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/router/LoadBalancerTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/model/ModelMetricsTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/scraper/OpenRouterScraperTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/dto/OpenAIChatRequestTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/router/ModelSelectorTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/api/OpenAICompatControllerIntegrationTest.java
+/home/aeslampanah/Desktop/Projects/robinllm/src/test/java/com/robinllm/client/OpenRouterClientTest.java

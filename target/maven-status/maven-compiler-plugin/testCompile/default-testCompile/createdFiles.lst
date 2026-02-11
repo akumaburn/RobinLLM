@@ -1,0 +1,15 @@
+com/robinllm/router/LoadBalancerTest.class
+com/robinllm/model/ModelPoolTest.class
+com/robinllm/router/ModelSelectorTest.class
+com/robinllm/config/AppConfigTest.class
+com/robinllm/repository/ModelRepositoryTest.class
+com/robinllm/model/ModelMetricsTest.class
+com/robinllm/repository/BaseRepositoryTest.class
+com/robinllm/repository/MetricsRepositoryTest.class
+com/robinllm/dto/OpenAIChatRequestTest.class
+com/robinllm/api/OpenAICompatControllerIntegrationTest.class
+com/robinllm/model/LLMModelTest.class
+com/robinllm/dto/OpenAIChatResponseTest.class
+com/robinllm/scraper/OpenRouterScraperTest.class
+com/robinllm/model/PerformanceMetricsTest.class
+com/robinllm/client/OpenRouterClientTest.class
