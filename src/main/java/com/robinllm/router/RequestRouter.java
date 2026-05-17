@@ -334,7 +334,8 @@ public class RequestRouter {
             }
         }
 
-        LOG.debug("Cancelled {} losing calls and {} losing streams", cancelledCalls, cancelledStreams);
+        LOG.info("Race decided: cancelled {} losing calls and {} losing streams",
+                cancelledCalls, cancelledStreams);
     }
 
     private void cancelEverything(List<Call> allCalls,

@@ -167,6 +167,16 @@ public class OpenRouterClient implements LLMClient {
             callRegistrar.accept(call);
         }
 
+        // Belt-and-suspenders: if the registrar pre-cancelled us (because
+        // another model has already won the race), abort immediately without
+        // touching the network. Don't rely on okhttp honoring cancel() before
+        // execute() - older 3.x versions don't always check the cancel flag
+        // when reusing a pooled connection.
+        if (call.isCanceled()) {
+            LOG.info("Aborting stream request for model {} - cancelled before execute", request.getModel());
+            throw new IOException("Cancelled by race coordinator");
+        }
+
         Response response;
         try {
             response = call.execute();
@@ -179,7 +189,7 @@ public class OpenRouterClient implements LLMClient {
                 long backoffMs = (long) (1000 * Math.pow(2, attempt));
                 LOG.warn("Stream request failed for model {}, retrying in {}ms (attempt {}): {}",
                         request.getModel(), backoffMs, attempt + 1, e.getMessage());
-                Thread.sleep(backoffMs);
+                cancellableSleep(call, backoffMs);
                 return sendChatRequestStreamCancellableWithRetry(request, attempt + 1, callRegistrar);
             }
             throw e;
@@ -198,13 +208,19 @@ public class OpenRouterClient implements LLMClient {
                 LOG.warn("Rate limit hit for model {}, backing off for {}ms (attempt {})",
                         request.getModel(), backoffMs, attempt + 1);
 
-                Thread.sleep(backoffMs);
+                // Release the connection BEFORE sleeping so we don't pin a
+                // pooled connection during the backoff.
+                response.close();
+
+                // Sleep cancellably so a losing worker stops waiting the
+                // moment the race coordinator cancels its Call, instead of
+                // burning through the full backoff and another rate-limit
+                // round-trip.
+                cancellableSleep(call, backoffMs);
 
                 if (attempt < 5) {
-                    response.close();
                     return sendChatRequestStreamCancellableWithRetry(request, attempt + 1, callRegistrar);
                 } else {
-                    response.close();
                     throw new Exception("Rate limit exceeded after " + (attempt + 1) + " retries");
                 }
             }
@@ -236,10 +252,33 @@ public class OpenRouterClient implements LLMClient {
                 long backoffMs = (long) (1000 * Math.pow(2, attempt));
                 LOG.warn("Stream request failed for model {}, retrying in {}ms (attempt {}): {}",
                         request.getModel(), backoffMs, attempt + 1, e.getMessage());
-                Thread.sleep(backoffMs);
+                cancellableSleep(call, backoffMs);
                 return sendChatRequestStreamCancellableWithRetry(request, attempt + 1, callRegistrar);
             }
             throw e;
+        }
+    }
+
+    /**
+     * Sleep for {@code totalMs} but wake up within ~100ms if the given Call
+     * gets cancelled externally. Throws IOException("Cancelled by race
+     * coordinator") if the Call was cancelled during (or before) the sleep.
+     */
+    private void cancellableSleep(Call call, long totalMs) throws InterruptedException, IOException {
+        final long pollIntervalMs = 100;
+        long deadline = System.currentTimeMillis() + totalMs;
+        while (true) {
+            if (call.isCanceled()) {
+                throw new IOException("Cancelled by race coordinator");
+            }
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                break;
+            }
+            Thread.sleep(Math.min(pollIntervalMs, remaining));
+        }
+        if (call.isCanceled()) {
+            throw new IOException("Cancelled by race coordinator");
         }
     }
 
