@@ -11,6 +11,7 @@ Robin LLM scrapes OpenRouter's website for free LLM options, continuously tests 
 - **Automatic Discovery**: Scans OpenRouter for free models, adds them to the pool automatically
 - **Performance Monitoring**: Continuously tests and measures model performance (latency, success rate, errors)
 - **Intelligent Routing**: Routes requests to the best-performing models using a weighted scoring algorithm
+- **Parallel Streaming Race**: Streaming requests in `auto` mode race up to 3 top models in parallel; the first model to emit a chunk wins and the other in-flight HTTP requests are cancelled immediately so the losing providers stop generating tokens
 - **OpenAI Compatible**: Drop-in replacement for OpenAI API with standard `/v1/chat/completions` endpoint
 - **Zero Configuration**: Works out of the box with automatic model discovery
 - **Built with Java 21**: Uses virtual threads for high-performance concurrent operations
@@ -22,7 +23,8 @@ Robin LLM scrapes OpenRouter's website for free LLM options, continuously tests 
 2. **Testing**: Each model is tested with standardized prompts to measure performance
 3. **Scoring**: Models are scored based on response time (60%), success rate (30%), and rate limit proximity (10%)
 4. **Routing**: Incoming requests are automatically routed to the best-performing available model
-5. **Failover**: If a model fails or degrades, requests automatically failover to the next best model
+5. **Streaming Race (auto mode)**: Streaming requests are dispatched to the top 3 candidate models in parallel. The first model whose first chunk arrives wins; every other in-flight HTTP `Call` is cancelled the instant the winner is declared, so the losing providers stop generating tokens and we stop paying for their compute. Workers that hadn't finished opening their connection yet self-cancel via the same coordinator.
+6. **Failover**: If a model fails or degrades, requests automatically failover to the next best model
 
 ## Technology Stack
 
@@ -39,6 +41,7 @@ Robin LLM scrapes OpenRouter's website for free LLM options, continuously tests 
 - **Circuit Breaker**: Automatically stops routing to failing models and retries after cooldown
 - **Automatic Failover**: Seamlessly switches to next best model on failure
 - **Round-Robin Load Balancing**: Distributes requests across top-performing models
+- **Streaming Race with Aggressive Cancellation**: For `auto` streaming requests, RobinLLM races up to 3 models concurrently and aborts the losing okhttp `Call`s the moment the winner's first chunk arrives - even if a loser is still mid-handshake or mid-headers. The race only fails when *all* contestants fail, not when the first one does, so a single fast failure doesn't take down the request.
 - **Performance Metrics**: Tracks latency, success rate, and requests per second
 - **Configurable Weights**: Customize the scoring algorithm for model selection
 

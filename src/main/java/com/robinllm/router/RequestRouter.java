@@ -12,19 +12,23 @@ import com.robinllm.model.ModelPool;
 import com.robinllm.repository.ModelRepository;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import okhttp3.Call;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 import java.util.Spliterators;
@@ -135,7 +139,15 @@ public class RequestRouter {
 
     /**
      * Routes a streaming request using parallel racing across multiple models.
-     * The first model to return a chunk wins, others are cancelled.
+     * The first model whose first chunk arrives wins; all other in-flight HTTP
+     * Calls and CancellableStreams are cancelled immediately so the losing
+     * providers stop generating tokens and we stop billing their compute.
+     *
+     * Cancellation is precise about timing: every worker registers its okhttp
+     * Call into a shared list BEFORE call.execute() blocks. When a winner is
+     * chosen we walk that list and cancel every Call except the winner's. A
+     * worker whose Call is registered after the race is decided self-cancels
+     * via the registrar.
      */
     private Stream<OpenAIChatStreamResponse> routeStreamWithParallelRace(OpenAIChatRequest request, List<LLMModel> models) {
         if (models.size() == 1) {
@@ -143,96 +155,209 @@ public class RequestRouter {
             return sendStreamRequestSingle(models.get(0), request);
         }
 
-        LOG.info("Starting parallel race with {} models: {}", 
-                models.size(), 
+        LOG.info("Starting parallel race with {} models: {}",
+                models.size(),
                 models.stream().map(LLMModel::getId).toList());
 
         long startTime = System.currentTimeMillis();
-        List<CancellableStream> activeStreams = new ArrayList<>();
-        AtomicReference<LLMModel> winningModel = new AtomicReference<>();
-        
-        try {
-            // Start all requests concurrently
-            List<CompletableFuture<RaceResult>> futures = new ArrayList<>();
-            
-            for (LLMModel model : models) {
-                OpenAIChatRequest translatedRequest = translateToModelFormat(request, model);
-                
-                CompletableFuture<RaceResult> future = CompletableFuture.supplyAsync(() -> {
-                    try {
-                        LOG.debug("Starting stream request for model: {}", model.getId());
-                        CancellableStream stream = sendStreamRequestCancellable(model, translatedRequest);
-                        
-                        synchronized (activeStreams) {
-                            activeStreams.add(stream);
-                        }
-                        
-                        // Wait for first chunk with timeout
-                        return raceForFirstChunk(stream, model);
-                    } catch (Exception e) {
-                        LOG.warn("Stream request failed for model {}: {}", model.getId(), e.getMessage());
-                        return new RaceResult(null, null, model, e);
-                    }
-                });
-                
-                futures.add(future);
-            }
 
-            // Race the futures - first to complete wins
-            CompletableFuture<Object> raceFuture = CompletableFuture.anyOf(futures.toArray(new CompletableFuture[0]));
-            
-            RaceResult winner;
-            try {
-                winner = (RaceResult) raceFuture.get(FIRST_CHUNK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                LOG.error("All parallel stream requests timed out after {} seconds", FIRST_CHUNK_TIMEOUT_SECONDS);
-                cancelAllStreams(activeStreams);
-                throw new RuntimeException("All models timed out after " + FIRST_CHUNK_TIMEOUT_SECONDS + " seconds");
-            }
+        // Shared race state. Lists are synchronized because workers populate
+        // them from different threads while the coordinator iterates.
+        final List<Call> allCalls = Collections.synchronizedList(new ArrayList<>());
+        final List<CancellableStream> allStreams = Collections.synchronizedList(new ArrayList<>());
+        final AtomicBoolean raceDecided = new AtomicBoolean(false);
+        final CompletableFuture<RaceResult> winnerFuture = new CompletableFuture<>();
+        final AtomicInteger failureCount = new AtomicInteger(0);
+        final int totalModels = models.size();
+        final List<CompletableFuture<RaceResult>> attemptFutures = new ArrayList<>();
 
-            if (winner == null || winner.firstChunk() == null) {
-                LOG.error("All parallel stream requests failed");
-                cancelAllStreams(activeStreams);
-                throw new RuntimeException("All models failed to respond");
-            }
+        for (LLMModel model : models) {
+            final OpenAIChatRequest translatedRequest = translateToModelFormat(request, model);
 
-            // We have a winner!
-            winningModel.set(winner.model());
-            LOG.info("Model {} won the race ({}ms)", winner.model().getId(), System.currentTimeMillis() - startTime);
+            Consumer<Call> registrar = call -> {
+                allCalls.add(call);
+                // If the race has already been decided while we were preparing,
+                // pre-cancel this Call so execute() aborts immediately and we
+                // never even open the connection to the provider.
+                if (raceDecided.get()) {
+                    call.cancel();
+                }
+            };
 
-            // Cancel all other streams except the winner
-            int cancelledCount = 0;
-            for (CancellableStream stream : activeStreams) {
-                if (stream != winner.stream() && !stream.isCancelled()) {
-                    try {
+            CompletableFuture<RaceResult> future = CompletableFuture.supplyAsync(() -> {
+                // Early-out if the race is already over before we ran.
+                if (raceDecided.get()) {
+                    return new RaceResult(null, null, model,
+                            new RuntimeException("Cancelled before start"));
+                }
+
+                CancellableStream stream = null;
+                try {
+                    LOG.debug("Starting stream request for model: {}", model.getId());
+                    stream = sendStreamRequestCancellable(model, translatedRequest, registrar);
+                    allStreams.add(stream);
+
+                    // The winner may have been declared while we were blocked
+                    // inside execute(). If so, close immediately rather than
+                    // attempting to read the first chunk.
+                    if (raceDecided.get()) {
                         stream.close();
-                        cancelledCount++;
+                        return new RaceResult(null, null, model,
+                                new RuntimeException("Cancelled mid-connect"));
+                    }
+
+                    return raceForFirstChunk(stream, model);
+                } catch (Exception e) {
+                    LOG.warn("Stream request failed for model {}: {}", model.getId(), e.getMessage());
+                    if (stream != null) {
+                        try { stream.close(); } catch (Exception ignored) {}
+                    }
+                    return new RaceResult(null, null, model, e);
+                }
+            });
+
+            attemptFutures.add(future);
+
+            future.whenComplete((result, throwable) -> {
+                // supplyAsync above already converts exceptions into a RaceResult,
+                // so throwable should normally be null. Treat it as a failure
+                // defensively.
+                boolean isSuccess = throwable == null
+                        && result != null
+                        && result.firstChunk() != null
+                        && result.stream() != null;
+
+                if (isSuccess) {
+                    if (raceDecided.compareAndSet(false, true)) {
+                        // We won. Complete the coordinator future, then cancel
+                        // every loser's Call and Stream.
+                        winnerFuture.complete(result);
+                        cancelLosers(result, allCalls, allStreams, attemptFutures);
+                    } else {
+                        // Someone else got there first. Close this stream so
+                        // its connection is released.
+                        try { result.stream().close(); } catch (Exception ignored) {}
+                    }
+                } else {
+                    // Failure. Only fail the race when ALL contestants have
+                    // failed - a single fast failure shouldn't abort the others.
+                    if (failureCount.incrementAndGet() == totalModels
+                            && raceDecided.compareAndSet(false, true)) {
+                        winnerFuture.completeExceptionally(
+                                new RuntimeException("All models failed to respond"));
+                    }
+                }
+            });
+        }
+
+        RaceResult winner;
+        try {
+            winner = winnerFuture.get(FIRST_CHUNK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            LOG.error("All parallel stream requests timed out after {} seconds", FIRST_CHUNK_TIMEOUT_SECONDS);
+            raceDecided.set(true);
+            cancelEverything(allCalls, allStreams, attemptFutures);
+            totalFailures.incrementAndGet();
+            throw new RuntimeException("All models timed out after " + FIRST_CHUNK_TIMEOUT_SECONDS + " seconds");
+        } catch (Exception e) {
+            raceDecided.set(true);
+            cancelEverything(allCalls, allStreams, attemptFutures);
+            totalFailures.incrementAndGet();
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new RuntimeException("Parallel stream routing failed: " + cause.getMessage(), cause);
+        }
+
+        LOG.info("Model {} won the race ({}ms)",
+                winner.model().getId(), System.currentTimeMillis() - startTime);
+
+        loadBalancer.recordSuccess(winner.model(), System.currentTimeMillis() - startTime);
+
+        // Create a new stream that starts with the first chunk, then continues with the rest
+        Stream<OpenAIChatStreamResponse> winningStream = createWinningStream(
+                winner.firstChunk(),
+                winner.stream(),
+                winner.model()
+        );
+
+        return winningStream.onClose(() -> {
+            LOG.info("Stream completed via model {} in {}ms",
+                    winner.model().getId(), System.currentTimeMillis() - startTime);
+            winner.stream().close();
+        });
+    }
+
+    /**
+     * Cancel every losing Call and CancellableStream. The winner's Call lives
+     * inside winner.stream(), so we identify and skip it by reference.
+     */
+    private void cancelLosers(RaceResult winner,
+                              List<Call> allCalls,
+                              List<CancellableStream> allStreams,
+                              List<CompletableFuture<RaceResult>> attemptFutures) {
+        final Call winnerCall = winner.stream() != null ? winner.stream().getCall() : null;
+        int cancelledCalls = 0;
+        int cancelledStreams = 0;
+
+        synchronized (allCalls) {
+            for (Call c : allCalls) {
+                if (c != winnerCall && !c.isCanceled()) {
+                    try {
+                        c.cancel();
+                        cancelledCalls++;
+                    } catch (Exception e) {
+                        LOG.debug("Error cancelling call: {}", e.getMessage());
+                    }
+                }
+            }
+        }
+
+        synchronized (allStreams) {
+            for (CancellableStream s : allStreams) {
+                if (s != winner.stream() && !s.isCancelled()) {
+                    try {
+                        s.close();
+                        cancelledStreams++;
                     } catch (Exception e) {
                         LOG.debug("Error cancelling stream: {}", e.getMessage());
                     }
                 }
             }
-            LOG.debug("Cancelled {} other streams", cancelledCount);
+        }
 
-            // Record success for the winning model
-            loadBalancer.recordSuccess(winner.model(), System.currentTimeMillis() - startTime);
+        // CompletableFuture.cancel(true) won't interrupt the worker, but cancelling
+        // the Call and closing the Stream already unblocks the worker; this just
+        // marks futures as cancelled for observability and prevents spurious
+        // late completions from doing extra work.
+        for (CompletableFuture<RaceResult> f : attemptFutures) {
+            if (!f.isDone()) {
+                f.cancel(false);
+            }
+        }
 
-            // Create a new stream that starts with the first chunk, then continues with the rest
-            Stream<OpenAIChatStreamResponse> winningStream = createWinningStream(
-                    winner.firstChunk(), 
-                    winner.stream(), 
-                    winner.model()
-            );
+        LOG.debug("Cancelled {} losing calls and {} losing streams", cancelledCalls, cancelledStreams);
+    }
 
-            return winningStream.onClose(() -> {
-                LOG.info("Stream completed via model {} in {}ms", winner.model().getId(), System.currentTimeMillis() - startTime);
-                winner.stream().close();
-            });
-
-        } catch (Exception e) {
-            cancelAllStreams(activeStreams);
-            totalFailures.incrementAndGet();
-            throw new RuntimeException("Parallel stream routing failed: " + e.getMessage(), e);
+    private void cancelEverything(List<Call> allCalls,
+                                  List<CancellableStream> allStreams,
+                                  List<CompletableFuture<RaceResult>> attemptFutures) {
+        synchronized (allCalls) {
+            for (Call c : allCalls) {
+                if (!c.isCanceled()) {
+                    try { c.cancel(); } catch (Exception ignored) {}
+                }
+            }
+        }
+        synchronized (allStreams) {
+            for (CancellableStream s : allStreams) {
+                if (!s.isCancelled()) {
+                    try { s.close(); } catch (Exception ignored) {}
+                }
+            }
+        }
+        for (CompletableFuture<RaceResult> f : attemptFutures) {
+            if (!f.isDone()) {
+                f.cancel(false);
+            }
         }
     }
 
@@ -293,16 +418,6 @@ public class RequestRouter {
                 false
             )
         ).onClose(winningStream::close);
-    }
-
-    private void cancelAllStreams(List<CancellableStream> streams) {
-        for (CancellableStream stream : streams) {
-            try {
-                stream.close();
-            } catch (Exception e) {
-                LOG.debug("Error cancelling stream: {}", e.getMessage());
-            }
-        }
     }
 
     private Stream<OpenAIChatStreamResponse> sendStreamRequestSingle(LLMModel model, OpenAIChatRequest request) {
@@ -434,6 +549,13 @@ public class RequestRouter {
     private CancellableStream sendStreamRequestCancellable(LLMModel model, OpenAIChatRequest request) throws Exception {
         var client = (OpenRouterClient) clientFactory.getClient(model);
         return client.sendChatRequestStreamCancellable(request);
+    }
+
+    private CancellableStream sendStreamRequestCancellable(LLMModel model,
+                                                           OpenAIChatRequest request,
+                                                           Consumer<Call> callRegistrar) throws Exception {
+        var client = (OpenRouterClient) clientFactory.getClient(model);
+        return client.sendChatRequestStreamCancellable(request, callRegistrar);
     }
 
     private LLMModel selectFallbackModel(LLMModel failedModel) {

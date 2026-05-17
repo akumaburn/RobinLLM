@@ -130,4 +130,12 @@ public class CancellableStream implements Closeable {
     public String getModelId() {
         return modelId;
     }
+
+    /**
+     * The underlying okhttp Call. Exposed so a race coordinator can identify
+     * the winner's Call and skip it while cancelling losers.
+     */
+    public Call getCall() {
+        return call;
+    }
 }

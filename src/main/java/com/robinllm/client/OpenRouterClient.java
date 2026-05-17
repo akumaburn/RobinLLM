@@ -25,6 +25,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Iterator;
+import java.util.function.Consumer;
 
 @ApplicationScoped
 public class OpenRouterClient implements LLMClient {
@@ -53,7 +54,19 @@ public class OpenRouterClient implements LLMClient {
      * cancel the request and close resources.
      */
     public CancellableStream sendChatRequestStreamCancellable(OpenAIChatRequest request) throws Exception {
-        return sendChatRequestStreamCancellableWithRetry(request, 0);
+        return sendChatRequestStreamCancellableWithRetry(request, 0, null);
+    }
+
+    /**
+     * Variant that lets a caller observe each underlying okhttp Call the instant
+     * it's constructed, before execute() blocks. The registrar is invoked once
+     * per attempt (including retries), so a race coordinator can cancel the Call
+     * mid-execute() to abort an in-flight HTTP connection. If the registrar
+     * cancels the Call, retries are skipped.
+     */
+    public CancellableStream sendChatRequestStreamCancellable(OpenAIChatRequest request,
+                                                              Consumer<Call> callRegistrar) throws Exception {
+        return sendChatRequestStreamCancellableWithRetry(request, 0, callRegistrar);
     }
 
     private OpenAIChatResponse sendChatRequestWithRetry(OpenAIChatRequest request, int attempt) throws Exception {
@@ -123,7 +136,9 @@ public class OpenRouterClient implements LLMClient {
         }
     }
 
-    private CancellableStream sendChatRequestStreamCancellableWithRetry(OpenAIChatRequest request, int attempt) throws Exception {
+    private CancellableStream sendChatRequestStreamCancellableWithRetry(OpenAIChatRequest request,
+                                                                        int attempt,
+                                                                        Consumer<Call> callRegistrar) throws Exception {
         String apiKey = appConfig.getOpenrouterApiKey();
         if (apiKey == null || apiKey.isEmpty()) {
             throw new Exception("OpenRouter API key not configured");
@@ -145,11 +160,34 @@ public class OpenRouterClient implements LLMClient {
                 .build();
 
         Call call = getHttpClient().newCall(httpRequest);
-        Response response = call.execute();
-        
+
+        // Hand the Call to the registrar BEFORE we block on execute(), so an
+        // external race coordinator can cancel it mid-flight.
+        if (callRegistrar != null) {
+            callRegistrar.accept(call);
+        }
+
+        Response response;
+        try {
+            response = call.execute();
+        } catch (IOException e) {
+            // If our Call was externally cancelled (lost the race), do not retry.
+            if (call.isCanceled()) {
+                throw new IOException("Cancelled by race coordinator", e);
+            }
+            if (attempt < 3) {
+                long backoffMs = (long) (1000 * Math.pow(2, attempt));
+                LOG.warn("Stream request failed for model {}, retrying in {}ms (attempt {}): {}",
+                        request.getModel(), backoffMs, attempt + 1, e.getMessage());
+                Thread.sleep(backoffMs);
+                return sendChatRequestStreamCancellableWithRetry(request, attempt + 1, callRegistrar);
+            }
+            throw e;
+        }
+
         try {
             int responseCode = response.code();
-            
+
             // Handle rate limiting
             if (responseCode == 429) {
                 handleRateLimit(request.getModel());
@@ -164,7 +202,7 @@ public class OpenRouterClient implements LLMClient {
 
                 if (attempt < 5) {
                     response.close();
-                    return sendChatRequestStreamCancellableWithRetry(request, attempt + 1);
+                    return sendChatRequestStreamCancellableWithRetry(request, attempt + 1, callRegistrar);
                 } else {
                     response.close();
                     throw new Exception("Rate limit exceeded after " + (attempt + 1) + " retries");
@@ -194,12 +232,12 @@ public class OpenRouterClient implements LLMClient {
 
         } catch (Exception e) {
             response.close();
-            if (e instanceof IOException && attempt < 3) {
+            if (e instanceof IOException && !call.isCanceled() && attempt < 3) {
                 long backoffMs = (long) (1000 * Math.pow(2, attempt));
                 LOG.warn("Stream request failed for model {}, retrying in {}ms (attempt {}): {}",
                         request.getModel(), backoffMs, attempt + 1, e.getMessage());
                 Thread.sleep(backoffMs);
-                return sendChatRequestStreamCancellableWithRetry(request, attempt + 1);
+                return sendChatRequestStreamCancellableWithRetry(request, attempt + 1, callRegistrar);
             }
             throw e;
         }
