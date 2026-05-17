@@ -522,21 +522,30 @@ public class RequestRouter {
         translated.setStop(originalRequest.getStop());
         translated.setStream(originalRequest.isStream());
 
-        int modelMaxTokens = model.getMaxTokens();
-        
-        if (modelMaxTokens > 0) {
-            // Always use model's max tokens if not specified in request
-            if (translated.getMaxTokens() == null) {
-                translated.setMaxTokens(modelMaxTokens);
-            } else {
-                // If request specifies maxTokens, ensure it doesn't exceed model limit
-                translated.setMaxTokens(Math.min(translated.getMaxTokens(), modelMaxTokens));
-            }
-        }
+        // max_tokens handling:
+        // - If the caller specified max_tokens, respect it but cap at the
+        //   model's advertised max so we don't immediately get a 400.
+        // - If the caller did NOT specify max_tokens, default to
+        //   api.max-tokens (4096) capped at the model's max. We deliberately
+        //   do NOT fall back to the model's advertised max or context window:
+        //   OpenRouter's `top_provider.max_completion_tokens` is the most
+        //   optimistic completion size across providers, and the actual
+        //   backend frequently caps far below it (e.g. Venice serving
+        //   llama-3.3-70b caps at 16384 even though OpenRouter advertises
+        //   65536). Forwarding the advertised value on every request causes
+        //   spurious 400 "max_tokens exceeded" errors; using a small,
+        //   configurable default avoids the failure mode while letting
+        //   callers opt into larger outputs explicitly.
+        int modelMax = model.getMaxTokens();
+        int defaultMax = appConfig.getApiMaxTokens();
 
-        if (model.getContextWindow() > 0 && translated.getMaxTokens() == null) {
-            // If context window is available and maxTokens not set, use context window
-            translated.setMaxTokens(model.getContextWindow());
+        if (translated.getMaxTokens() == null) {
+            int chosen = modelMax > 0 ? Math.min(defaultMax, modelMax) : defaultMax;
+            if (chosen > 0) {
+                translated.setMaxTokens(chosen);
+            }
+        } else if (modelMax > 0 && translated.getMaxTokens() > modelMax) {
+            translated.setMaxTokens(modelMax);
         }
 
         return translated;
