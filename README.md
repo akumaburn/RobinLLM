@@ -4,45 +4,46 @@ An intelligent LLM routing service that automatically discovers free language mo
 
 ## Overview
 
-Robin LLM scrapes OpenRouter's website for free LLM options, continuously tests their performance, and provides an OpenAI-compatible API that intelligently routes requests to the best available model. Think of it as a smart load balancer for free LLMs.
+Robin LLM queries OpenRouter's model API for free LLM options, can optionally benchmark them in the background, and provides an OpenAI-compatible API that intelligently routes requests to the best available model. Think of it as a smart load balancer for free LLMs.
 
 ## Features
 
-- **Automatic Discovery**: Scans OpenRouter for free models, adds them to the pool automatically
-- **Performance Monitoring**: Continuously tests and measures model performance (latency, success rate, errors)
-- **Intelligent Routing**: Routes requests to the best-performing models using a weighted scoring algorithm
-- **Parallel Streaming Race**: Streaming requests in `auto` mode race up to 3 top models in parallel; the first model to emit a chunk wins and the other in-flight HTTP requests are cancelled immediately so the losing providers stop generating tokens
+- **Automatic Discovery**: Pulls free models from OpenRouter's `/api/v1/models` JSON endpoint and adds them to the pool automatically
+- **Performance Monitoring (opt-in)**: Optional background benchmarker that probes models with canned prompts and records latency / success-rate / errors. Disabled by default (`metrics.enabled=false`); turn on to populate `/v1/models/{id}/metrics`
+- **Intelligent Routing**: Selects the best model for non-streaming requests using a weighted scoring algorithm (latency / success rate / rate-limit proximity)
+- **Parallel Streaming Race**: Streaming requests in `auto` mode dispatch up to 3 top models in parallel. The first model to emit a chunk wins; every other in-flight okhttp Call is cancelled and any losing worker sitting in a rate-limit backoff sleep wakes up within ~100ms instead of burning through the full backoff. The race only fails when *all* contestants fail
 - **OpenAI Compatible**: Drop-in replacement for OpenAI API with standard `/v1/chat/completions` endpoint
 - **Zero Configuration**: Works out of the box with automatic model discovery
-- **Built with Java 21**: Uses virtual threads for high-performance concurrent operations
+- **Built with Java 21 + Quarkus**: Background scraper and metrics tester run on virtual-thread executors; the request hot path uses CompletableFuture on the common ForkJoinPool
 - **Lightweight**: Built on Quarkus for minimal resource usage and fast startup
 
 ## How It Works
 
-1. **Scraping**: Every hour, Robin LLM scrapes OpenRouter's model page to discover new free models
-2. **Testing**: Each model is tested with standardized prompts to measure performance
+1. **Discovery**: Every `scraper.interval` (default 1h), Robin LLM calls OpenRouter's `/api/v1/models` JSON endpoint, filters for free models, and persists them to SQLite
+2. **Optional benchmarking**: If `metrics.enabled=true`, a background tester probes the top-N models with canned prompts to populate latency / success-rate metrics. Off by default
 3. **Scoring**: Models are scored based on response time (60%), success rate (30%), and rate limit proximity (10%)
-4. **Routing**: Incoming requests are automatically routed to the best-performing available model
-5. **Streaming Race (auto mode)**: Streaming requests are dispatched to the top 3 candidate models in parallel. The first model whose first chunk arrives wins; every other in-flight HTTP `Call` is cancelled the instant the winner is declared, so the losing providers stop generating tokens and we stop paying for their compute. Workers that hadn't finished opening their connection yet self-cancel via the same coordinator.
-6. **Failover**: If a model fails or degrades, requests automatically failover to the next best model
+4. **Non-streaming routing**: Incoming non-streaming requests pick the single best-scoring model. On failure they retry with exponential backoff and fall back to the next best model
+5. **Streaming race (`auto` mode)**: Streaming requests are dispatched to the top 3 candidate models in parallel. The first model whose first chunk arrives wins; every other in-flight okhttp `Call` is cancelled the instant the winner is declared, so losing providers stop generating tokens immediately. Losers that were waiting out a rate-limit backoff wake up within ~100ms instead of burning through the full sleep. Workers whose connection hadn't yet opened self-cancel via the same coordinator. The race only fails when *all* three contestants fail or the 10s first-chunk timeout fires
+6. **Streaming with explicit model**: When the request specifies a single model (not `auto`), Robin LLM skips the race and streams from that model directly
+7. **Circuit breaker / failover**: Models that exceed the failure threshold are temporarily removed from selection and re-tested after a cooldown
 
 ## Technology Stack
 
-- **Java 21**: Latest LTS with virtual threads
-- **Quarkus**: Fast, lightweight framework for low-latency API
-- **SQLite**: Embedded database for metrics persistence
+- **Java 21**: Latest LTS; virtual threads used for the background scraper and metrics tester executors
+- **Quarkus 3.6**: Fast, lightweight framework for low-latency API
+- **SQLite (via xerial jdbc)**: Embedded database for model and metrics persistence
 - **Maven**: Build and dependency management
-- **Jsoup**: HTML scraping for model discovery
-- **Retrofit/OkHttp**: HTTP client for LLM API communication
-- **RestEasy Reactive**: Reactive REST API framework
+- **OkHttp** (transitive via Retrofit 2.9): HTTP client used for streaming and non-streaming OpenRouter calls
+- **RESTEasy Reactive + Jackson**: REST framework and JSON (de)serialization
 
 ## Advanced Features
 
 - **Circuit Breaker**: Automatically stops routing to failing models and retries after cooldown
-- **Automatic Failover**: Seamlessly switches to next best model on failure
-- **Round-Robin Load Balancing**: Distributes requests across top-performing models
-- **Streaming Race with Aggressive Cancellation**: For `auto` streaming requests, RobinLLM races up to 3 models concurrently and aborts the losing okhttp `Call`s the moment the winner's first chunk arrives - even if a loser is still mid-handshake or mid-headers. The race only fails when *all* contestants fail, not when the first one does, so a single fast failure doesn't take down the request.
-- **Performance Metrics**: Tracks latency, success rate, and requests per second
+- **Automatic Failover (non-streaming)**: Non-streaming requests that fail retry with exponential backoff and roll over to the next best model
+- **Round-Robin Load Balancing**: Distributes requests across top-performing models after scoring narrows the pool
+- **Streaming Race with Aggressive Cancellation**: For `auto` streaming requests, RobinLLM races up to 3 models concurrently and aborts the losing okhttp `Call`s the moment the winner's first chunk arrives - even if a loser is still mid-handshake, mid-headers, or sitting in a rate-limit backoff. The race only fails when *all* contestants fail, not when the first one does, so a single fast failure doesn't take down the request
+- **Sensible default for `max_tokens`**: When the caller omits `max_tokens`, Robin LLM forwards the configured `api.max-tokens` (default 4096) capped at the model's advertised max - it does *not* blast the model's optimistic advertised completion size, which often exceeds what the upstream provider actually accepts and produces spurious 400s. Caller-supplied `max_tokens` is honored but still capped at the model's max
+- **Performance Metrics**: Tracks latency, success rate, P95/P99 latency and requests per second (when `metrics.enabled=true`)
 - **Configurable Weights**: Customize the scoring algorithm for model selection
 
 ## Getting Started
@@ -109,7 +110,7 @@ All endpoints are prefixed with `/v1`.
 Send chat completion requests (OpenAI compatible)
 
 #### GET /v1/models
-List all available free models with their performance metrics
+List all discovered free models (id, owner, created timestamp - OpenAI-compatible shape). For latency / success-rate data, call `/v1/models/{id}/metrics`
 
 #### GET /v1/models/{id}
 Get details for a specific model
@@ -133,20 +134,20 @@ Service information and available endpoints
 
 Robin LLM can be configured via environment variables or `application.properties`:
 
-### Scraping Configuration
+### Model Discovery Configuration
 ```properties
 scraper.enabled=true                    # Enable/disable model discovery
-scraper.interval=1h                     # Scraping interval
-scraper.openrouter.url=https://openrouter.ai/models
-scraper.filter=free                    # Model filter criteria
+scraper.interval=1h                     # How often to refresh the model list
+scraper.openrouter.url=https://openrouter.ai/models   # Informational; the JSON list is fetched from openrouter.base-url + /models
+scraper.filter=free                     # Model filter criteria
 ```
 
 ### Metrics Configuration
 ```properties
-metrics.enabled=true                    # Enable/disable metrics collection
-metrics.interval=1h                    # Testing interval
+metrics.enabled=false                   # Background benchmarking. Disabled by default in shipped config
+metrics.interval=1h                     # Testing interval (when enabled)
 metrics.test.prompts=What is 2+2?,Explain photosynthesis
-metrics.top-models=3                   # Number of top models to test
+metrics.top-models=3                    # Number of top models to test
 ```
 
 ### Routing Configuration
@@ -162,8 +163,8 @@ router.retry.backoff=1000              # Backoff time in milliseconds
 ### API Configuration
 ```properties
 api.compatibility=openai                # API compatibility mode
-api.max-tokens=4096                     # Maximum tokens per request
-api.timeout=30000                       # Request timeout in milliseconds
+api.max-tokens=4096                     # Default max_tokens used when the caller omits it (capped at the model's advertised max)
+api.timeout=30000                       # Connect/write timeout for OpenRouter HTTP calls (ms). Read timeout is disabled so streaming can run indefinitely
 ```
 
 ### OpenRouter Configuration
